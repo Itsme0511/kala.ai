@@ -1,3 +1,37 @@
+## Kala.ai — Setup
+
+1) Install dependencies
+```
+pnpm i || npm i || yarn
+```
+
+2) Start the API server (optionally with Google Gemini for AI)
+```
+GEMINI_API_KEY=your_key_here node server/index.js
+```
+
+Optional background removal + enhancement:
+```
+REMOVE_BG_KEY=your_removebg_key GEMINI_API_KEY=your_key_here node server/index.js
+```
+
+3) Configure the mobile app to reach your server
+- For Android emulator: use `http://10.0.2.2:4000`
+- For iOS simulator: `http://localhost:4000`
+- For physical devices: use your machine IP, e.g. `http://192.168.1.10:4000`
+
+Set the URL via Expo env var before starting the app:
+```
+set EXPO_PUBLIC_API_URL=http://10.0.2.2:4000
+```
+
+4) Run the app
+```
+npm run start
+```
+
+Login/Signup uses Firebase (config in `firebase/firebaseConfig.ts`).
+
 # Welcome to your Expo app 👋
 
 This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
