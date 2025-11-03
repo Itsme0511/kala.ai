@@ -32,6 +32,14 @@ npm run start
 
 Login/Signup uses Firebase (config in `firebase/firebaseConfig.ts`).
 
+5) **IMPORTANT: Update Firestore Security Rules**
+
+Open [Firebase Console](https://console.firebase.google.com) → Your Project → Firestore Database → Rules
+
+Copy and paste the rules from `firestore.rules` file, then click **Publish**.
+
+This allows authenticated users to read/write their own user data. Without these rules, you'll get "Missing or insufficient permissions" errors.
+
 # Welcome to your Expo app 👋
 
 This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
