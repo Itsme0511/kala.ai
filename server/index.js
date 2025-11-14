@@ -2,10 +2,14 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const multer = require('multer');
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+
 const upload = multer();
 const app = express();
 
-// Enable CORS for mobile app
+// Enable CORS for mobile/web app
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -18,9 +22,116 @@ app.use((req, res, next) => {
 });
 
 app.use(bodyParser.json({ limit: '15mb' }));
+
 const PORT = process.env.PORT || 4000;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
 const REMOVE_BG_KEY = process.env.REMOVE_BG_KEY;
+const DEFAULT_MONGO_URI = 'mongodb+srv://apoorv2002singh:NhkqYjQqG10kn13E@cluster0.mmtos.mongodb.net/';
+const DEFAULT_JWT_SECRET = 'NhkqYjQqG10kn13E';
+const MONGO_URI = process.env.MONGO_URI || DEFAULT_MONGO_URI;
+const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
+
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️  JWT_SECRET not set. Using fallback secret provided in source.');
+}
+
+let mongoPromise = null;
+async function connectDB(uri = MONGO_URI) {
+  if (mongoose.connection.readyState === 1) {
+    return mongoose.connection;
+  }
+  if (!uri) {
+    throw new Error('MONGO_URI not configured');
+  }
+  if (!mongoPromise) {
+    mongoPromise = mongoose.connect(uri, {
+      autoIndex: true,
+      serverSelectionTimeoutMS: 5000,
+    });
+  }
+  await mongoPromise;
+  return mongoose.connection;
+}
+
+if (process.env.NODE_ENV !== 'test') {
+  connectDB()
+    .then(() => console.log('✅ Connected to MongoDB'))
+    .catch((err) => console.error('MongoDB connection failed:', err.message));
+}
+
+const artisanSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true },
+    email: { type: String, required: true, unique: true },
+    passwordHash: { type: String, required: true },
+    bio: { type: String },
+    location: { type: String },
+    avatar: { type: String },
+  },
+  { timestamps: true }
+);
+
+const productSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true },
+    description: { type: String, required: true },
+    price: { type: Number, required: true },
+    images: [{ type: String }],
+    category: { type: String, required: true },
+    stock: { type: Number, default: 0 },
+    artisanId: { type: mongoose.Schema.Types.ObjectId, ref: 'Artisan', required: true },
+    status: { type: String, enum: ['draft', 'published'], default: 'draft' },
+  },
+  { timestamps: true }
+);
+
+productSchema.index({ title: 'text', description: 'text', category: 'text' });
+
+const Artisan = mongoose.models.Artisan || mongoose.model('Artisan', artisanSchema);
+const Product = mongoose.models.Product || mongoose.model('Product', productSchema);
+
+function sanitizeArtisan(doc) {
+  if (!doc) return null;
+  const plain = doc.toObject ? doc.toObject() : doc;
+  const { passwordHash, __v, ...rest } = plain;
+  return rest;
+}
+
+function generateToken(artisan) {
+  if (!JWT_SECRET) {
+    throw new Error('JWT_SECRET not configured');
+  }
+  return jwt.sign(
+    { id: artisan._id.toString(), email: artisan.email },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+}
+
+async function authMiddleware(req, res, next) {
+  try {
+    await connectDB();
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+    const payload = jwt.verify(token, JWT_SECRET);
+    const artisanId = payload.id || payload.sub;
+    if (!artisanId) {
+      return res.status(401).json({ ok: false, error: 'Invalid token payload' });
+    }
+    const artisan = await Artisan.findById(artisanId);
+    if (!artisan) {
+      return res.status(401).json({ ok: false, error: 'Account not found' });
+    }
+    req.artisan = artisan;
+    next();
+  } catch (err) {
+    console.error('Auth error:', err.message);
+    return res.status(401).json({ ok: false, error: 'Invalid or expired token' });
+  }
+}
 
 async function removeBackground(imageBase64) {
   try {
@@ -95,8 +206,220 @@ async function enhanceImagePng(buffer) {
   return png;
 }
 
+// ---------- Auth & Account endpoints ----------
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    await connectDB();
+    const { name, email, password, location, bio } = req.body || {};
+    if (!name || !email || !password) {
+      return res.status(400).json({ ok: false, error: 'Name, email, and password are required' });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    const existing = await Artisan.findOne({ email: normalizedEmail });
+    if (existing) {
+      return res.status(409).json({ ok: false, error: 'An account with this email already exists' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const artisan = await Artisan.create({ name: name.trim(), email: normalizedEmail, passwordHash, location, bio });
+    const token = generateToken(artisan);
+    res.status(201).json({ ok: true, token, artisan: sanitizeArtisan(artisan) });
+  } catch (err) {
+    console.error('Register failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
-// Endpoint 1: Enhance image (remove background, resize, sharpen)
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    await connectDB();
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: 'Email and password are required' });
+    }
+    const artisan = await Artisan.findOne({ email: email.trim().toLowerCase() });
+    if (!artisan) {
+      return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    }
+    const valid = await bcrypt.compare(password, artisan.passwordHash);
+    if (!valid) {
+      return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    }
+    const token = generateToken(artisan);
+    res.json({ ok: true, token, artisan: sanitizeArtisan(artisan) });
+  } catch (err) {
+    console.error('Login failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/account/profile', authMiddleware, async (req, res) => {
+  res.json({ ok: true, artisan: sanitizeArtisan(req.artisan) });
+});
+
+app.put('/api/account/profile', authMiddleware, async (req, res) => {
+  try {
+    const updatableFields = ['name', 'bio', 'location', 'avatar'];
+    updatableFields.forEach((field) => {
+      if (field in req.body) {
+        req.artisan[field] = req.body[field];
+      }
+    });
+    await req.artisan.save();
+    res.json({ ok: true, artisan: sanitizeArtisan(req.artisan) });
+  } catch (err) {
+    console.error('Profile update failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------- Product endpoints ----------
+app.post('/api/products', authMiddleware, async (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      price,
+      images = [],
+      category,
+      stock = 0,
+      status = 'draft',
+    } = req.body || {};
+
+    if (!title || !description || typeof price === 'undefined' || !category) {
+      return res.status(400).json({ ok: false, error: 'Title, description, price, and category are required' });
+    }
+
+    const normalizedStatus = status === 'published' ? 'published' : 'draft';
+    const priceNumber = Number(price);
+    const stockNumber = Number(stock) || 0;
+
+    const safeImages = Array.isArray(images)
+      ? images.filter(Boolean)
+      : String(images || '')
+          .split(',')
+          .map((img) => img.trim())
+          .filter(Boolean);
+
+    let product = await Product.create({
+      title: title.trim(),
+      description: description.trim(),
+      price: priceNumber,
+      images: safeImages,
+      category: category.trim(),
+      stock: stockNumber,
+      status: normalizedStatus,
+      artisanId: req.artisan._id,
+    });
+
+    product = await product.populate('artisanId', 'name email location');
+
+    res.status(201).json({ ok: true, product });
+  } catch (err) {
+    console.error('Create product failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.put('/api/products/:id', authMiddleware, async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id);
+    if (!product) {
+      return res.status(404).json({ ok: false, error: 'Product not found' });
+    }
+    if (product.artisanId.toString() !== req.artisan._id.toString()) {
+      return res.status(403).json({ ok: false, error: 'You do not have permission to update this product' });
+    }
+
+    const updatableFields = ['title', 'description', 'price', 'images', 'category', 'stock', 'status'];
+    updatableFields.forEach((field) => {
+      if (field in req.body) {
+        if (field === 'status') {
+          product.status = req.body.status === 'published' ? 'published' : 'draft';
+        } else if (field === 'images') {
+          product.images = Array.isArray(req.body.images)
+            ? req.body.images.filter(Boolean)
+            : [];
+        } else if (field === 'price') {
+          product.price = Number(req.body.price);
+        } else if (field === 'stock') {
+          product.stock = Number(req.body.stock) || 0;
+        } else if (typeof req.body[field] === 'string') {
+          product[field] = req.body[field].trim();
+        } else {
+          product[field] = req.body[field];
+        }
+      }
+    });
+
+    await product.save();
+    await product.populate('artisanId', 'name email location');
+    res.json({ ok: true, product });
+  } catch (err) {
+    console.error('Update product failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/products/mine', authMiddleware, async (req, res) => {
+  try {
+    const products = await Product.find({ artisanId: req.artisan._id })
+      .sort({ updatedAt: -1 })
+      .populate('artisanId', 'name email location');
+    res.json({ ok: true, products });
+  } catch (err) {
+    console.error('Fetch my products failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/marketplace', async (req, res) => {
+  try {
+    await connectDB();
+    const { page = 1, limit = 12, q, category, sort = 'newest' } = req.query;
+    const pageNumber = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNumber = Math.min(Math.max(parseInt(limit, 10) || 12, 1), 48);
+
+    const filters = { status: 'published' };
+    if (q) {
+      filters.title = { $regex: q, $options: 'i' };
+    }
+    if (category && category !== 'all') {
+      filters.category = category;
+    }
+
+    const sortOptions = {
+      newest: { createdAt: -1 },
+      price_asc: { price: 1 },
+      price_desc: { price: -1 },
+    };
+    const sortOrder = sortOptions[sort] || sortOptions.newest;
+
+    const [products, total] = await Promise.all([
+      Product.find(filters)
+        .sort(sortOrder)
+        .skip((pageNumber - 1) * limitNumber)
+        .limit(limitNumber)
+        .populate('artisanId', 'name email location'),
+      Product.countDocuments(filters),
+    ]);
+
+    res.json({
+      ok: true,
+      products,
+      pagination: {
+        page: pageNumber,
+        limit: limitNumber,
+        total,
+        totalPages: Math.ceil(total / limitNumber),
+      },
+    });
+  } catch (err) {
+    console.error('Marketplace fetch failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------- Existing AI image endpoints ----------
 app.post('/api/enhance-image', upload.none(), async (req, res) => {
   try {
     const { croppedImageBase64 } = req.body || {};
@@ -418,9 +741,29 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, message: 'Server is running' });
 });
 
-// Listen on all network interfaces (0.0.0.0) so phone can access it
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on 0.0.0.0:${PORT}`);
-  console.log(`Local: http://localhost:${PORT}`);
-  console.log(`Network: http://<your-ip>:${PORT}`);
-});
+async function startServer(port = PORT) {
+  await connectDB();
+  return new Promise((resolve) => {
+    const server = app.listen(port, '0.0.0.0', () => {
+      console.log(`Server running on 0.0.0.0:${port}`);
+      console.log(`Local: http://localhost:${port}`);
+      console.log(`Network: http://<your-ip>:${port}`);
+      resolve(server);
+    });
+  });
+}
+
+if (require.main === module) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  app,
+  startServer,
+  connectDB,
+  Artisan,
+  Product,
+};
