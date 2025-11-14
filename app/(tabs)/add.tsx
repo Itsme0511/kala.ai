@@ -10,43 +10,97 @@ export default function AddProduct() {
   const [title, setTitle] = useState('');
   const [desc, setDesc] = useState('');
   const [imageUri, setImageUri] = useState<string | null>(null);
+  const [croppedImageBase64, setCroppedImageBase64] = useState<string | null>(null);
   const [price, setPrice] = useState('');
   const [quantity, setQuantity] = useState('1');
   const [marketplaces, setMarketplaces] = useState<{ amazon: boolean; flipkart: boolean; etsy: boolean }>({ amazon: true, flipkart: false, etsy: false });
+  const [isEnhancing, setIsEnhancing] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
 
   async function pickImage() {
-    const res = await ImagePicker.launchImageLibraryAsync({ quality: 0.8, allowsEditing: true });
-    if (!res.canceled) setImageUri(res.assets[0].uri!);
+    const res = await ImagePicker.launchImageLibraryAsync({ quality: 0.8, allowsEditing: true, base64: true });
+    if (!res.canceled) {
+      const asset = res.assets[0];
+      setImageUri(asset.uri!);
+
+      let dataUrl: string | null = null;
+      if (asset.base64) {
+        dataUrl = `data:${asset.mimeType || 'image/jpeg'};base64,${asset.base64}`;
+      } else {
+        const fileBase64 = await FileSystem.readAsStringAsync(asset.uri!, { encoding: 'base64' });
+        dataUrl = `data:${asset.mimeType || 'image/jpeg'};base64,${fileBase64}`;
+      }
+      setCroppedImageBase64(dataUrl);
+    }
   }
 
-  async function enhanceAndGenerate() {
-    if (!imageUri) return Alert.alert('Please pick an image first');
+  async function cropImage() {
+    if (!croppedImageBase64) return Alert.alert('Please pick and crop an image first');
     
     try {
-      Alert.alert('Processing', 'Analyzing image with AI...');
-      const b = await FileSystem.readAsStringAsync(imageUri, { encoding: 'base64' });
-
-      const resp = await fetch(`${API_BASE_URL}/api/enhance-and-generate`, {
+      setIsEnhancing(true);
+      const resp = await fetch(`${API_BASE_URL}/api/enhance-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64: b, language: 'hi-IN' }),
+        body: JSON.stringify({ croppedImageBase64 }),
       });
 
+      if (!resp.ok) {
+        const errorText = await resp.text();
+        Alert.alert('Crop Image Failed', `Server returned ${resp.status}: ${errorText}`);
+        return;
+      }
+
       const json = await resp.json();
+      if (json.ok && json.enhancedImageUrl) {
+        setImageUri(json.enhancedImageUrl);
+        setCroppedImageBase64(json.enhancedImageUrl);
+        Alert.alert('Success', 'Image cropped and enhanced successfully.');
+      } else {
+        Alert.alert('Crop Image Failed', json.error || 'Unknown error');
+      }
+    } catch (err: any) {
+      console.error('Crop error:', err);
+      Alert.alert('Crop Image Failed', err.message || 'Unable to crop image');
+    } finally {
+      setIsEnhancing(false);
+    }
+  }
+
+  async function generateProductInfo() {
+    if (!croppedImageBase64) return Alert.alert('Please crop the image first');
+    
+    try {
+      setIsGenerating(true);
+      const resp = await fetch(`${API_BASE_URL}/api/generate-product-info`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ croppedImageBase64, language: 'hi-IN' }),
+      });
+
+      if (!resp.ok) {
+        const errorText = await resp.text();
+        Alert.alert('Generate Text Failed', `Server returned ${resp.status}: ${errorText}`);
+        return;
+      }
+
+      const json = await resp.json();
+      
       if (json.ok) {
         setTitle(json.title || '');
         setDesc(json.description || '');
-        // Set estimated price if provided by AI
         if (json.estimatedPrice && json.estimatedPrice !== '0') {
           setPrice(json.estimatedPrice);
         }
-        if (json.enhancedImageUrl) setImageUri(json.enhancedImageUrl);
-        Alert.alert('Success', 'Product analyzed! Title, description, and price have been generated.');
+        Alert.alert('Success', 'Title, description, and price generated.');
       } else {
-        Alert.alert('AI generation failed', json.error || 'Unknown error');
+        Alert.alert('Generate Text Failed', json.error || 'Unknown error');
       }
     } catch (err: any) {
-      Alert.alert('Error', err.message || 'Failed to generate product details');
+      console.error('Generate text error:', err);
+      Alert.alert('Generate Text Failed', err.message || 'Unable to generate product info');
+    } finally {
+      setIsGenerating(false);
     }
   }
 
@@ -100,10 +154,35 @@ export default function AddProduct() {
       <TextInput label="Quantity" value={quantity} onChangeText={setQuantity} keyboardType="numeric" style={{ marginTop: 12 }} />
 
       <Button onPress={pickImage} style={{ marginTop: 12 }}>Pick Image</Button>
-      {imageUri ? <Image source={{ uri: imageUri }} style={{ height: 220, marginTop: 12 }} /> : null}
+      {imageUri ? (
+        <Image 
+          source={{ uri: imageUri }} 
+          style={{ height: 220, marginTop: 12, width: '100%' }} 
+          resizeMode="contain"
+          onError={() => {
+            Alert.alert('Image Error', 'Failed to load image. Please try again.');
+          }}
+        />
+      ) : null}
 
-      <Button mode="contained" onPress={enhanceAndGenerate} style={{ marginTop: 16 }}>
-        Enhance Image & Generate Text (AI)
+      <Button 
+        mode="contained" 
+        onPress={cropImage} 
+        style={{ marginTop: 16 }} 
+        loading={isEnhancing}
+        disabled={isEnhancing}
+      >
+        Crop Image
+      </Button>
+
+      <Button 
+        mode="contained" 
+        onPress={generateProductInfo} 
+        style={{ marginTop: 12 }} 
+        loading={isGenerating}
+        disabled={isGenerating}
+      >
+        Generate Text
       </Button>
 
       <View style={{ marginTop: 16 }}>
